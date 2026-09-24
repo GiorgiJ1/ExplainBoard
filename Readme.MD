@@ -1,6 +1,6 @@
 # ExplainBoard
 
-[![Rust](https://github.com/YOUR_USERNAME/explainboard/actions/workflows/rust.yml/badge.svg)](https://github.com/YOUR_USERNAME/explainboard/actions/workflows/rust.yml)
+[![Rust](https://github.com/GiorgiJ1/ExplainBoard/actions/workflows/rust.yml/badge.svg)](https://github.com/GiorgiJ1/ExplainBoard/actions/workflows/rust.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Rust edition](https://img.shields.io/badge/rust-2021-orange.svg)
 
