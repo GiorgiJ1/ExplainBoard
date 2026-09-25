@@ -28,7 +28,7 @@ pub const ERROR_RED: Color32 = Color32::from_rgb(230, 80, 80);
 
 /// The dark frame used for the top bar and the bottom toolbar.
 pub fn dark_frame() -> Frame {
-    Frame::none()
+    Frame::NONE
         .fill(APP_BACKGROUND)
-        .inner_margin(Margin::same(12.0))
+        .inner_margin(Margin::same(12))
 }

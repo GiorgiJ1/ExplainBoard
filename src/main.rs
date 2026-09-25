@@ -149,11 +149,11 @@ impl ExplainBoardApp {
             ui.add_space(8.0);
 
             let is_generating = self.result_receiver.is_some();
-            egui::Frame::none()
+            egui::Frame::NONE
                 .fill(theme::SURFACE)
                 .corner_radius(10.0)
                 .stroke(egui::Stroke::new(1.0, theme::BORDER))
-                .inner_margin(egui::Margin::same(10.0))
+                .inner_margin(egui::Margin::same(10))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         if is_generating {
