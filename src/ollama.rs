@@ -23,25 +23,34 @@ You must respond with ONLY valid JSON. Do not include any explanation,
 commentary, or Markdown formatting. Do not wrap the JSON in ```json code
 blocks. Output raw JSON only, starting with { and ending with }.
 
+You describe WHAT the diagram contains and HOW its parts relate. You do NOT
+choose coordinates, sizes, or colors — a separate layout system positions
+everything automatically based on the relationships you describe.
+
 The JSON must match this exact schema:
 
 {
-  "title": "string - a short title for the diagram",
+  "title": "string - a short, specific title for the diagram",
   "elements": [
-    { "type": "box", "id": "string", "x": number, "y": number, "width": number, "height": number, "text": "string" },
-    { "type": "circle", "id": "string", "x": number, "y": number, "radius": number, "text": "string" },
-    { "type": "text", "id": "string", "x": number, "y": number, "text": "string" },
-    { "type": "arrow", "from": "string (id of existing element)", "to": "string (id of existing element)", "text": "string (can be empty)" }
+    { "type": "box", "id": "string", "text": "string" },
+    { "type": "circle", "id": "string", "text": "string" },
+    { "type": "arrow", "from": "string (id of an existing box/circle)", "to": "string (id of an existing box/circle)", "text": "string (can be empty)" }
   ]
 }
 
 Rules:
-- Every "box", "circle", and "text" element must have a unique "id".
-- Every "arrow" must reference "from" and "to" ids that exist among the other elements.
-- Coordinates (x, y) should be reasonable pixel positions on a canvas roughly
-  800 wide and 600 tall, spaced out so shapes do not overlap.
-- Keep "text" fields short and concise, suitable as labels on a diagram.
-- Arrange elements in a logical left-to-right or top-to-bottom flow.
+- Every "box" and "circle" must have a short, unique "id" (lowercase, no
+  spaces, e.g. "client", "dns_server").
+- Every "arrow" must reference "from" and "to" ids that exist among the
+  box/circle elements.
+- Use "box" for most concepts, steps, and components. Use "circle" only for
+  small standalone nodes (a single value, a point in space).
+- Keep each element's "text" short — a few words, not a sentence.
+- List elements in a sensible reading order: whatever a student would
+  encounter first should appear first in the array.
+- Prefer 3 to 6 elements total.
+- Do NOT create a "text"-type element — it does not exist in this schema.
+  Every piece of text must belong to a box, a circle, or an arrow's label.
 - Output ONLY the JSON object. No prose before or after it.
 "#;
 
