@@ -29,7 +29,29 @@ fn main() -> eframe::Result<()> {
 enum Tool {
     Select,
     Pan,
+    Pen,
+    Eraser,
 }
+
+const PEN_COLORS: &[egui::Color32] = &[
+    egui::Color32::WHITE,
+    theme::ACCENT,
+    egui::Color32::from_rgb(244, 63, 94),  // red/pink
+    egui::Color32::from_rgb(250, 204, 21), // yellow
+    egui::Color32::from_rgb(59, 130, 246), // blue
+    egui::Color32::from_rgb(74, 222, 128), // green
+];
+
+const PEN_WIDTHS: &[(&str, f32)] = &[("S", 2.0), ("M", 4.0), ("L", 8.0)];
+
+/// How close (world-space) the eraser needs to pass to a stroke/element to
+/// erase it, at 100% zoom. Divided by the current zoom so it feels like a
+/// constant-size eraser on screen regardless of zoom level.
+const ERASER_SCREEN_RADIUS: f32 = 14.0;
+
+/// Minimum world-space distance between recorded points in a pen stroke,
+/// so a slow-moving mouse doesn't flood the stroke with redundant points.
+const MIN_POINT_SPACING: f32 = 2.0;
 
 struct ExplainBoardApp {
     prompt: String,
@@ -42,6 +64,12 @@ struct ExplainBoardApp {
     selected_id: Option<String>,
     drag_offset: egui::Vec2,
     fit_requested: bool,
+
+    pen_color: egui::Color32,
+    pen_width: f32,
+    /// Points recorded so far for the stroke currently being drawn (world
+    /// space), while the pen is down. None when not actively drawing.
+    current_stroke: Option<Vec<egui::Pos2>>,
 
     /// Text currently in the context panel's edit field, and which
     /// element id it belongs to (so switching selection refreshes it).
@@ -73,6 +101,9 @@ impl Default for ExplainBoardApp {
             selected_id: None,
             drag_offset: egui::Vec2::ZERO,
             fit_requested: true,
+            pen_color: theme::ACCENT,
+            pen_width: 4.0,
+            current_stroke: None,
             edit_buffer: String::new(),
             edit_buffer_for: None,
             ask_ai_text: String::new(),
@@ -279,7 +310,7 @@ impl ExplainBoardApp {
             return; // a text field is focused; don't steal its keystrokes
         }
 
-        let (escape, delete, backspace, ctrl_z, ctrl_shift_z, ctrl_d) = ctx.input(|input| {
+        let (escape, delete, backspace, ctrl_z, ctrl_shift_z, ctrl_d, key_v, key_p, key_e) = ctx.input(|input| {
             let ctrl = input.modifiers.command;
             (
                 input.key_pressed(egui::Key::Escape),
@@ -288,6 +319,9 @@ impl ExplainBoardApp {
                 ctrl && !input.modifiers.shift && input.key_pressed(egui::Key::Z),
                 ctrl && input.modifiers.shift && input.key_pressed(egui::Key::Z),
                 ctrl && input.key_pressed(egui::Key::D),
+                !ctrl && input.key_pressed(egui::Key::V),
+                !ctrl && input.key_pressed(egui::Key::P),
+                !ctrl && input.key_pressed(egui::Key::E),
             )
         });
 
@@ -304,6 +338,15 @@ impl ExplainBoardApp {
         }
         if ctrl_d && self.selected_id.is_some() {
             self.duplicate_selected();
+        }
+        if key_v {
+            self.tool = Tool::Select;
+        }
+        if key_p {
+            self.tool = Tool::Pen;
+        }
+        if key_e {
+            self.tool = Tool::Eraser;
         }
     }
 }
@@ -335,6 +378,13 @@ fn toggle_button(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
 /// glassy dark theme instead of egui's default button look.
 fn action_button(ui: &mut egui::Ui, label: &str) -> bool {
     ui.add_sized([76.0, 26.0], egui::Button::new(egui::RichText::new(label).color(theme::TEXT_ON_DARK)).fill(theme::SURFACE)).clicked()
+}
+
+/// A small square button for the pen width picker (S/M/L), three of which
+/// need to fit side by side in the toolbar's narrow column.
+fn width_button(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
+    let (bg, text_color) = if active { (theme::ACCENT, theme::APP_BACKGROUND) } else { (theme::SURFACE, theme::TEXT_ON_DARK) };
+    ui.add_sized([24.0, 24.0], egui::Button::new(egui::RichText::new(label).color(text_color).small()).fill(bg)).clicked()
 }
 
 impl ExplainBoardApp {
@@ -378,6 +428,43 @@ impl ExplainBoardApp {
                     ui.add_space(4.0);
                     if toggle_button(ui, "Hand", self.tool == Tool::Pan) {
                         self.tool = Tool::Pan;
+                    }
+                    ui.add_space(4.0);
+                    if toggle_button(ui, "Pen", self.tool == Tool::Pen) {
+                        self.tool = Tool::Pen;
+                    }
+                    ui.add_space(4.0);
+                    if toggle_button(ui, "Eraser", self.tool == Tool::Eraser) {
+                        self.tool = Tool::Eraser;
+                    }
+
+                    if self.tool == Tool::Pen {
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("Color").color(theme::MUTED_TEXT).small());
+                        ui.horizontal_wrapped(|ui| {
+                            for &color in PEN_COLORS {
+                                let picked = self.pen_color == color;
+                                let size = if picked { 22.0 } else { 18.0 };
+                                let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::click());
+                                ui.painter().circle_filled(rect.center(), size / 2.0, color);
+                                if picked {
+                                    ui.painter().circle_stroke(rect.center(), size / 2.0 + 2.0, egui::Stroke::new(1.5, theme::TEXT_ON_DARK));
+                                }
+                                if response.clicked() {
+                                    self.pen_color = color;
+                                }
+                            }
+                        });
+
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Width").color(theme::MUTED_TEXT).small());
+                        ui.horizontal(|ui| {
+                            for &(label, width) in PEN_WIDTHS {
+                                if width_button(ui, label, (self.pen_width - width).abs() < 0.1) {
+                                    self.pen_width = width;
+                                }
+                            }
+                        });
                     }
 
                     ui.add_space(10.0);
@@ -441,11 +528,11 @@ impl ExplainBoardApp {
 
             ui.add_space(6.0);
 
-            egui::Frame::NONE
+            egui::Frame::none()
                 .fill(theme::SURFACE)
                 .corner_radius(14.0)
-                .stroke(egui::Stroke::new(1.2_f32, theme::ACCENT))
-                .inner_margin(egui::Margin::symmetric(14, 10))
+                .stroke(egui::Stroke::new(1.2, theme::ACCENT))
+                .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                 .show(ui, |ui| {
                     if self.generate_receiver.is_some() {
                         ui.horizontal(|ui| {
@@ -602,6 +689,52 @@ impl ExplainBoardApp {
                 }
             }
 
+            // --- Pen: draw a freehand stroke while the mouse is down ---
+            if self.tool == Tool::Pen {
+                if response.drag_started() && response.dragged_by(egui::PointerButton::Primary) {
+                    self.push_history(); // the whole stroke is one undo step
+                    self.current_stroke = Some(Vec::new());
+                }
+                if response.dragged_by(egui::PointerButton::Primary) {
+                    if let (Some(stroke), Some(mouse_screen)) = (&mut self.current_stroke, response.interact_pointer_pos()) {
+                        let mouse_world = self.camera.screen_to_world(canvas_origin, mouse_screen);
+                        let far_enough = stroke.last().is_none_or(|last| (*last - mouse_world).length() > MIN_POINT_SPACING);
+                        if far_enough {
+                            stroke.push(mouse_world);
+                        }
+                    }
+                }
+                if response.drag_stopped() {
+                    if let Some(points) = self.current_stroke.take() {
+                        if points.len() >= 2 {
+                            self.layout.add_stroke(points, self.pen_color, self.pen_width);
+                            self.status = "Drew a stroke.".to_string();
+                        } else {
+                            self.history.pop(); // nothing meaningful drawn; drop the unused snapshot
+                        }
+                    }
+                }
+            }
+
+            // --- Eraser: remove whatever the cursor touches ---
+            if self.tool == Tool::Eraser {
+                let beginning = (response.drag_started() && response.dragged_by(egui::PointerButton::Primary)) || response.clicked();
+                if beginning {
+                    self.push_history();
+                }
+                let erasing = response.dragged_by(egui::PointerButton::Primary) || response.clicked();
+                if erasing {
+                    if let Some(mouse_screen) = response.interact_pointer_pos() {
+                        let mouse_world = self.camera.screen_to_world(canvas_origin, mouse_screen);
+                        let radius = ERASER_SCREEN_RADIUS / self.camera.zoom;
+                        if self.layout.erase_at(mouse_world, radius) {
+                            self.selected_id = None;
+                            self.status = "Erased.".to_string();
+                        }
+                    }
+                }
+            }
+
             // --- Draw ---
             let painter = ui.painter_at(canvas_rect);
             painter.rect_filled(canvas_rect, 0.0, theme::CANVAS_BACKGROUND);
@@ -611,6 +744,10 @@ impl ExplainBoardApp {
             let mut arrows = self.layout.resolve_arrows();
             arrows.extend(self.layout.fixed_arrows.iter().cloned());
             renderer::draw_diagram(&painter, canvas_origin, &self.layout, &arrows, &self.camera, self.selected_id.as_deref());
+            renderer::draw_strokes(&painter, canvas_origin, &self.layout, &self.camera);
+            if let Some(points) = &self.current_stroke {
+                renderer::draw_live_stroke(&painter, canvas_origin, points, self.pen_color, self.pen_width, &self.camera);
+            }
         });
     }
 }

@@ -13,7 +13,7 @@
 
 use crate::diagram::{Diagram, Element};
 use crate::operations::{NewElement, Operation};
-use eframe::egui::{Pos2, Rect, Vec2};
+use eframe::egui::{Color32, Pos2, Rect, Vec2};
 
 const BOX_MIN_WIDTH: f32 = 140.0;
 const BOX_MAX_WIDTH: f32 = 260.0;
@@ -66,6 +66,15 @@ pub struct LayoutArrow {
     pub to: Option<String>,
 }
 
+/// A freehand pen stroke. Named `PenStroke` (not `Stroke`) to avoid clashing
+/// with egui's own `Stroke` type (a line style), which the renderer also uses.
+#[derive(Clone)]
+pub struct PenStroke {
+    pub points: Vec<Pos2>, // world-space
+    pub color: Color32,
+    pub width: f32,
+}
+
 #[derive(Clone)]
 pub struct LaidOutDiagram {
     pub title: String,
@@ -78,6 +87,8 @@ pub struct LaidOutDiagram {
     /// ping-pong layout, whose arrow rows are meaningful positions in their
     /// own right, not just "shortest line between two centers".
     pub fixed_arrows: Vec<LayoutArrow>,
+    /// Freehand pen strokes, drawn by the user directly (not by the AI).
+    pub strokes: Vec<PenStroke>,
 }
 
 #[derive(Clone, Copy)]
@@ -101,6 +112,11 @@ impl LaidOutDiagram {
         }
         for c in &self.circles {
             bounds = bounds.union(Rect::from_center_size(c.center, Vec2::splat(c.radius * 2.0)));
+        }
+        for s in &self.strokes {
+            for point in &s.points {
+                bounds = bounds.union(Rect::from_center_size(*point, Vec2::splat(2.0)));
+            }
         }
         if !bounds.is_finite() {
             bounds = Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 100.0));
@@ -331,6 +347,38 @@ impl LaidOutDiagram {
         Err(format!("no arrow from \"{from}\" to \"{to}\""))
     }
 
+    /// Adds a completed pen stroke to the board. Strokes with fewer than 2
+    /// points (a tap, not a drag) are ignored — there's nothing to draw.
+    pub fn add_stroke(&mut self, points: Vec<Pos2>, color: Color32, width: f32) {
+        if points.len() < 2 {
+            return;
+        }
+        self.strokes.push(PenStroke { points, color, width });
+    }
+
+    /// Erases whatever is within `radius` (world-space) of `point`: any
+    /// box/circle under the eraser, and any stroke passing near it. This is
+    /// whole-object erasing (a touched stroke disappears entirely) rather
+    /// than partial/pixel erasing, which keeps the model simple. Returns
+    /// true if anything was actually erased.
+    pub fn erase_at(&mut self, point: Pos2, radius: f32) -> bool {
+        let mut erased = false;
+
+        if let Some(id) = self.hit_test(point) {
+            if self.remove_element(&id).is_ok() {
+                erased = true;
+            }
+        }
+
+        let before = self.strokes.len();
+        self.strokes.retain(|s| !stroke_hit(s, point, radius));
+        if self.strokes.len() != before {
+            erased = true;
+        }
+
+        erased
+    }
+
     /// Validates and applies a batch of AI-proposed operations, one at a
     /// time. Invalid operations are skipped (with a message returned to the
     /// caller) rather than aborting the whole batch or crashing.
@@ -372,6 +420,26 @@ fn unique_id_from(board: &LaidOutDiagram, candidate: &str) -> String {
         }
         counter += 1;
     }
+}
+
+/// Whether `point` comes within `radius` of any segment of `stroke`.
+fn stroke_hit(stroke: &PenStroke, point: Pos2, radius: f32) -> bool {
+    if stroke.points.len() < 2 {
+        return stroke.points.first().is_some_and(|p| (*p - point).length() <= radius);
+    }
+    stroke.points.windows(2).any(|pair| distance_to_segment(point, pair[0], pair[1]) <= radius)
+}
+
+/// Shortest distance from `point` to the line segment between `a` and `b`.
+fn distance_to_segment(point: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let segment = b - a;
+    let length_sq = segment.length_sq();
+    if length_sq < 0.0001 {
+        return (point - a).length();
+    }
+    let t = ((point - a).dot(segment) / length_sq).clamp(0.0, 1.0);
+    let projection = a + segment * t;
+    (point - projection).length()
 }
 
 /// Finds the point on the edge of a shape, closest to `toward`, starting
@@ -488,7 +556,7 @@ fn layout_vertical(diagram: &Diagram, nodes: Vec<&Element>, arrows: Vec<&Element
         })
         .collect();
 
-    LaidOutDiagram { title: diagram.title.clone(), boxes, circles, arrow_links, fixed_arrows: Vec::new() }
+    LaidOutDiagram { title: diagram.title.clone(), boxes, circles, arrow_links, fixed_arrows: Vec::new(), strokes: Vec::new() }
 }
 
 fn layout_two_column(
@@ -553,5 +621,5 @@ fn layout_two_column(
         }
     }
 
-    LaidOutDiagram { title: diagram.title.clone(), boxes, circles, arrow_links: Vec::new(), fixed_arrows }
+    LaidOutDiagram { title: diagram.title.clone(), boxes, circles, arrow_links: Vec::new(), fixed_arrows, strokes: Vec::new() }
 }

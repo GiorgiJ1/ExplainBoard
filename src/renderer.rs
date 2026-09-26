@@ -120,6 +120,32 @@ pub fn draw_diagram(
     }
 }
 
+/// Draws every completed pen stroke. Called after `draw_diagram` so
+/// hand-drawn annotations render on top of AI-generated content, matching
+/// how someone would actually annotate over a printed diagram.
+pub fn draw_strokes(painter: &Painter, canvas_origin: Pos2, layout: &LaidOutDiagram, camera: &Camera) {
+    for stroke in &layout.strokes {
+        draw_stroke_points(painter, canvas_origin, &stroke.points, stroke.color, stroke.width, camera);
+    }
+}
+
+/// Draws a stroke that's still being drawn (the user's pen is currently
+/// down), so it appears live instead of only after the mouse is released.
+pub fn draw_live_stroke(painter: &Painter, canvas_origin: Pos2, points: &[Pos2], color: egui::Color32, width: f32, camera: &Camera) {
+    draw_stroke_points(painter, canvas_origin, points, color, width, camera);
+}
+
+fn draw_stroke_points(painter: &Painter, canvas_origin: Pos2, points: &[Pos2], color: egui::Color32, width: f32, camera: &Camera) {
+    if points.len() < 2 {
+        return;
+    }
+    let screen_width = (width * camera.zoom).max(1.0);
+    let screen_points: Vec<Pos2> = points.iter().map(|p| camera.world_to_screen(canvas_origin, *p)).collect();
+    for pair in screen_points.windows(2) {
+        painter.line_segment([pair[0], pair[1]], Stroke::new(screen_width, color));
+    }
+}
+
 /// Draws a soft glowing outline: a wide, faint stroke behind a crisp one,
 /// which reads as a neon glow without needing any actual blur/shader
 /// support (egui's painter can't blur — this fakes it with layered strokes).
@@ -146,8 +172,8 @@ fn glow_circle_stroke(painter: &Painter, center: Pos2, radius: f32, color: egui:
 }
 
 fn glow_line(painter: &Painter, start: Pos2, end: Pos2, color: egui::Color32) {
-    painter.line_segment([start, end], Stroke::new(5.0_f32, color.gamma_multiply(0.15)));
-    painter.line_segment([start, end], Stroke::new(1.6_f32, color));
+    painter.line_segment([start, end], Stroke::new(5.0, color.gamma_multiply(0.15)));
+    painter.line_segment([start, end], Stroke::new(1.6, color));
 }
 
 fn draw_box_shape(painter: &Painter, rect: Rect, selected: bool) {
