@@ -4,7 +4,7 @@
 
 use crate::layout::{LaidOutDiagram, LayoutArrow};
 use crate::theme;
-use eframe::egui::{Align2, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
+use eframe::egui::{self, Align2, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
 
 /// Tracks how far the whiteboard has been panned and how zoomed in it is.
 ///
@@ -79,8 +79,8 @@ pub fn draw_title(painter: &Painter, canvas_origin: Pos2, layout: &LaidOutDiagra
     let bounds = layout.bounds();
     let title_world = Pos2::new(bounds.center().x, bounds.min.y + 30.0);
     let pos = camera.world_to_screen(canvas_origin, title_world);
-    let font_size = (20.0 * camera.zoom).max(8.0);
-    painter.text(pos, Align2::CENTER_CENTER, &layout.title, FontId::proportional(font_size), theme::TEXT);
+    let font_size = (22.0 * camera.zoom).max(8.0);
+    painter.text(pos, Align2::CENTER_CENTER, &layout.title, FontId::proportional(font_size), theme::ACCENT);
 }
 
 /// Draws every box, circle, and arrow. `arrows` is passed in separately
@@ -120,18 +120,48 @@ pub fn draw_diagram(
     }
 }
 
+/// Draws a soft glowing outline: a wide, faint stroke behind a crisp one,
+/// which reads as a neon glow without needing any actual blur/shader
+/// support (egui's painter can't blur — this fakes it with layered strokes).
+fn glow_rect_stroke(painter: &Painter, rect: Rect, corner_radius: f32, color: egui::Color32, intensity: f32) {
+    painter.rect_stroke(
+        rect.expand(5.0 * intensity),
+        corner_radius + 5.0 * intensity,
+        Stroke::new(7.0 * intensity, color.gamma_multiply(0.12)),
+        StrokeKind::Outside,
+    );
+    painter.rect_stroke(
+        rect.expand(2.0 * intensity),
+        corner_radius + 2.0 * intensity,
+        Stroke::new(3.0 * intensity, color.gamma_multiply(0.30)),
+        StrokeKind::Outside,
+    );
+    painter.rect_stroke(rect, corner_radius, Stroke::new(1.5 * intensity, color), StrokeKind::Outside);
+}
+
+fn glow_circle_stroke(painter: &Painter, center: Pos2, radius: f32, color: egui::Color32, intensity: f32) {
+    painter.circle_stroke(center, radius + 5.0 * intensity, Stroke::new(7.0 * intensity, color.gamma_multiply(0.12)));
+    painter.circle_stroke(center, radius + 2.0 * intensity, Stroke::new(3.0 * intensity, color.gamma_multiply(0.30)));
+    painter.circle_stroke(center, radius, Stroke::new(1.5 * intensity, color));
+}
+
+fn glow_line(painter: &Painter, start: Pos2, end: Pos2, color: egui::Color32) {
+    painter.line_segment([start, end], Stroke::new(5.0_f32, color.gamma_multiply(0.15)));
+    painter.line_segment([start, end], Stroke::new(1.6_f32, color));
+}
+
 fn draw_box_shape(painter: &Painter, rect: Rect, selected: bool) {
-    let border_color = if selected { theme::SELECTED_BORDER } else { theme::BORDER_STRONG };
-    let border_width = if selected { 2.5_f32 } else { 1.5_f32 };
-    painter.rect_filled(rect, 8.0, theme::SURFACE);
-    painter.rect_stroke(rect, 8.0, Stroke::new(border_width, border_color), StrokeKind::Outside);
+    let color = if selected { theme::SELECTED_BORDER } else { theme::BORDER_STRONG };
+    let intensity = if selected { 1.5 } else { 1.0 };
+    painter.rect_filled(rect, 10.0, theme::SURFACE);
+    glow_rect_stroke(painter, rect, 10.0, color, intensity);
 }
 
 fn draw_circle_shape(painter: &Painter, center: Pos2, radius: f32, selected: bool) {
-    let border_color = if selected { theme::SELECTED_BORDER } else { theme::BORDER_STRONG };
-    let border_width = if selected { 2.5_f32 } else { 1.5_f32 };
+    let color = if selected { theme::SELECTED_BORDER } else { theme::BORDER_STRONG };
+    let intensity = if selected { 1.5 } else { 1.0 };
     painter.circle_filled(center, radius, theme::SURFACE);
-    painter.circle_stroke(center, radius, Stroke::new(border_width, border_color));
+    glow_circle_stroke(painter, center, radius, color, intensity);
 }
 
 fn draw_centered_lines(painter: &Painter, center: Pos2, lines: &[String], zoom: f32) {
@@ -146,7 +176,7 @@ fn draw_centered_lines(painter: &Painter, center: Pos2, lines: &[String], zoom: 
 }
 
 fn draw_arrow(painter: &Painter, start: Pos2, end: Pos2, label: &str, zoom: f32) {
-    painter.line_segment([start, end], Stroke::new(1.8_f32, theme::BORDER_STRONG));
+    glow_line(painter, start, end, theme::BORDER_STRONG);
 
     // A simple arrowhead: two short lines angled back from the tip.
     let direction = (end - start).normalized();
@@ -154,15 +184,15 @@ fn draw_arrow(painter: &Painter, start: Pos2, end: Pos2, label: &str, zoom: f32)
     let head_angle = 0.45_f32; // radians
     let left_wing = rotate(direction, head_angle) * -head_length;
     let right_wing = rotate(direction, -head_angle) * -head_length;
-    painter.line_segment([end, end + left_wing], Stroke::new(1.8_f32, theme::BORDER_STRONG));
-    painter.line_segment([end, end + right_wing], Stroke::new(1.8_f32, theme::BORDER_STRONG));
+    glow_line(painter, end, end + left_wing, theme::BORDER_STRONG);
+    glow_line(painter, end, end + right_wing, theme::BORDER_STRONG);
 
     if !label.is_empty() {
         let midpoint = start + (end - start) * 0.5;
         let font_size = (13.0 * zoom).max(6.0);
         // A small background behind the label so it stays readable over the
         // grid or the line itself, instead of floating awkwardly.
-        let galley = painter.layout_no_wrap(label.to_string(), FontId::proportional(font_size), theme::MUTED_TEXT);
+        let galley = painter.layout_no_wrap(label.to_string(), FontId::proportional(font_size), theme::TEXT);
         let label_pos = midpoint - Vec2::new(0.0, 14.0);
         let label_rect = Rect::from_center_size(label_pos, galley.size() + Vec2::new(8.0, 4.0));
         painter.rect_filled(label_rect, 4.0, theme::CANVAS_BACKGROUND);

@@ -14,7 +14,7 @@ use std::sync::mpsc::{self, Receiver};
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 780.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1250.0, 800.0]),
         ..Default::default()
     };
 
@@ -317,17 +317,35 @@ impl eframe::App for ExplainBoardApp {
         self.handle_shortcuts(ctx);
 
         self.top_bar(ctx);
-        self.toolbar(ctx);
+        self.ai_bar(ctx);
+        self.left_toolbar(ctx);
         self.context_panel(ctx);
         self.canvas(ctx);
     }
+}
+
+/// A tool-select button: filled with the accent color while active, so it
+/// reads clearly which tool (Select/Hand) is currently in effect.
+fn toggle_button(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
+    let (bg, text_color) = if active { (theme::ACCENT, theme::APP_BACKGROUND) } else { (theme::SURFACE, theme::TEXT_ON_DARK) };
+    ui.add_sized([76.0, 30.0], egui::Button::new(egui::RichText::new(label).color(text_color)).fill(bg)).clicked()
+}
+
+/// A plain toolbar action button (Fit/Reset/Clear/etc), styled to match the
+/// glassy dark theme instead of egui's default button look.
+fn action_button(ui: &mut egui::Ui, label: &str) -> bool {
+    ui.add_sized([76.0, 26.0], egui::Button::new(egui::RichText::new(label).color(theme::TEXT_ON_DARK)).fill(theme::SURFACE)).clicked()
 }
 
 impl ExplainBoardApp {
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_bar").frame(theme::dark_frame()).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("ExplainBoard").color(theme::TEXT_ON_DARK).strong().size(16.0));
+                ui.label(egui::RichText::new("✏").color(theme::ACCENT).size(18.0));
+                ui.label(egui::RichText::new("Explain").color(theme::TEXT_ON_DARK).strong().size(17.0));
+                ui.label(egui::RichText::new("Board").color(theme::ACCENT).strong().size(17.0));
+                ui.label(egui::RichText::new("v0.1.0").color(theme::MUTED_TEXT).small());
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (dot_color, status_text) = if self.busy() {
                         (theme::MUTED_TEXT, "Ollama thinking...")
@@ -338,38 +356,72 @@ impl ExplainBoardApp {
                     };
                     ui.colored_label(dot_color, "●");
                     ui.label(egui::RichText::new(status_text).color(theme::MUTED_TEXT));
+                    ui.add_space(10.0);
+                    ui.add_enabled(false, egui::Button::new("⚙")).on_disabled_hover_text("Settings — coming soon");
+                    ui.add_enabled(false, egui::Button::new("📁")).on_disabled_hover_text("Saved boards — coming soon");
                 });
             });
+        });
+    }
 
-            ui.add_space(8.0);
+    fn left_toolbar(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("left_toolbar")
+            .resizable(false)
+            .exact_width(96.0)
+            .frame(theme::dark_frame())
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+                    if toggle_button(ui, "Select", self.tool == Tool::Select) {
+                        self.tool = Tool::Select;
+                    }
+                    ui.add_space(4.0);
+                    if toggle_button(ui, "Hand", self.tool == Tool::Pan) {
+                        self.tool = Tool::Pan;
+                    }
 
-            egui::Frame::NONE
-                .fill(theme::SURFACE)
-                .corner_radius(10.0)
-                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
-                .inner_margin(egui::Margin::same(10))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if self.generate_receiver.is_some() {
-                            ui.add(egui::Spinner::new().size(16.0));
-                            ui.label(egui::RichText::new("Generating explanation...").color(theme::MUTED_TEXT));
-                        } else {
-                            let available = (ui.available_width() - 34.0).max(20.0);
-                            let text_response = ui.add_sized(
-                                [available, 22.0],
-                                egui::TextEdit::singleline(&mut self.prompt)
-                                    .hint_text("Explain how recursion works...")
-                                    .frame(false),
-                            );
-                            let submitted = text_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            if ui.add_enabled(!self.busy(), egui::Button::new("↗")).clicked() || (submitted && !self.busy()) {
-                                self.start_generate();
-                            }
-                        }
-                    });
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+
+                    if action_button(ui, "+") {
+                        self.camera.zoom = (self.camera.zoom * 1.2).min(5.0);
+                    }
+                    if action_button(ui, "−") {
+                        self.camera.zoom = (self.camera.zoom / 1.2).max(0.1);
+                    }
+                    ui.label(egui::RichText::new(format!("{:.0}%", self.camera.zoom * 100.0)).color(theme::MUTED_TEXT).small());
+
+                    ui.add_space(10.0);
+                    if action_button(ui, "Fit") {
+                        self.fit_requested = true;
+                    }
+                    if action_button(ui, "Reset") {
+                        self.camera = Camera::default();
+                    }
+                    if action_button(ui, "Clear") {
+                        self.push_history();
+                        self.layout = layout::layout(&Diagram { title: String::new(), elements: Vec::new() });
+                        self.selected_id = None;
+                        self.status = "Cleared.".to_string();
+                    }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+
+                    if ui.add_enabled(!self.history.is_empty(), egui::Button::new("Undo")).clicked() {
+                        self.undo();
+                    }
+                    if ui.add_enabled(!self.redo_stack.is_empty(), egui::Button::new("Redo")).clicked() {
+                        self.redo();
+                    }
                 });
+            });
+    }
 
-            ui.add_space(6.0);
+    fn ai_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("ai_bar").frame(theme::dark_frame()).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Try:").color(theme::MUTED_TEXT).small());
                 if ui.small_button("TCP handshake").clicked() {
@@ -381,53 +433,51 @@ impl ExplainBoardApp {
                 if ui.small_button("Magnetic force").clicked() {
                     self.load_diagram(diagram::example_physics(), "Loaded");
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let status_color = if self.status.starts_with("Error") { theme::ERROR_RED } else { theme::MUTED_TEXT };
+                    ui.label(egui::RichText::new(&self.status).color(status_color).small());
+                });
             });
 
             ui.add_space(6.0);
-            let status_color = if self.status.starts_with("Error") { theme::ERROR_RED } else { theme::MUTED_TEXT };
-            ui.label(egui::RichText::new(&self.status).color(status_color).small());
-        });
-    }
 
-    fn toolbar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("toolbar").frame(theme::dark_frame()).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.selectable_label(self.tool == Tool::Select, "Select").clicked() {
-                    self.tool = Tool::Select;
-                }
-                if ui.selectable_label(self.tool == Tool::Pan, "Hand").clicked() {
-                    self.tool = Tool::Pan;
-                }
-                ui.separator();
-                if ui.button("+").clicked() {
-                    self.camera.zoom = (self.camera.zoom * 1.2).min(5.0);
-                }
-                if ui.button("−").clicked() {
-                    self.camera.zoom = (self.camera.zoom / 1.2).max(0.1);
-                }
-                if ui.button("Fit").clicked() {
-                    self.fit_requested = true;
-                }
-                if ui.button("Reset").clicked() {
-                    self.camera = Camera::default();
-                }
-                if ui.button("Clear").clicked() {
-                    self.push_history();
-                    self.layout = layout::layout(&Diagram { title: String::new(), elements: Vec::new() });
-                    self.selected_id = None;
-                    self.status = "Cleared.".to_string();
-                }
-                ui.separator();
-                if ui.add_enabled(!self.history.is_empty(), egui::Button::new("Undo")).clicked() {
-                    self.undo();
-                }
-                if ui.add_enabled(!self.redo_stack.is_empty(), egui::Button::new("Redo")).clicked() {
-                    self.redo();
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(format!("{:.0}%", self.camera.zoom * 100.0)).color(theme::TEXT_ON_DARK));
+            egui::Frame::NONE
+                .fill(theme::SURFACE)
+                .corner_radius(14.0)
+                .stroke(egui::Stroke::new(1.2_f32, theme::ACCENT))
+                .inner_margin(egui::Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    if self.generate_receiver.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(18.0));
+                            ui.label(egui::RichText::new("Generating explanation...").color(theme::MUTED_TEXT));
+                        });
+                    } else {
+                        ui.label(egui::RichText::new("AI Input").color(theme::MUTED_TEXT).small());
+                    }
+
+                    ui.horizontal(|ui| {
+                        let available = (ui.available_width() - 170.0).max(20.0);
+                        let text_response = ui.add_sized(
+                            [available, 24.0],
+                            egui::TextEdit::singleline(&mut self.prompt)
+                                .hint_text("Explain the process of photosynthesis from my textbook...")
+                                .frame(false),
+                        );
+                        let submitted = text_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                        ui.add_enabled(false, egui::Button::new("🎤 Voice")).on_disabled_hover_text("Voice input coming soon");
+
+                        let generate_button =
+                            egui::Button::new(egui::RichText::new("Generate Diagram").color(theme::APP_BACKGROUND).strong())
+                                .fill(theme::ACCENT);
+                        if ui.add_enabled(!self.busy(), generate_button).clicked() || (submitted && !self.busy()) {
+                            self.start_generate();
+                        }
+                    });
                 });
-            });
+
+            ui.add_space(4.0);
         });
     }
 
