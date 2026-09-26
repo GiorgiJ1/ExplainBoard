@@ -1,18 +1,20 @@
 mod diagram;
 mod layout;
 mod ollama;
+mod operations;
 mod renderer;
 mod theme;
 
 use diagram::Diagram;
 use eframe::egui;
 use layout::LaidOutDiagram;
+use operations::OperationBatch;
 use renderer::Camera;
 use std::sync::mpsc::{self, Receiver};
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 750.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 780.0]),
         ..Default::default()
     };
 
@@ -36,16 +38,27 @@ struct ExplainBoardApp {
     status: String,
     ollama_ok: bool,
     tool: Tool,
-    /// Id of the currently selected/dragged box or circle, if any.
+
     selected_id: Option<String>,
-    /// World-space offset between the mouse and the dragged element's
-    /// center, captured when the drag starts, so the shape doesn't "jump".
     drag_offset: egui::Vec2,
-    /// Set for one frame whenever the camera should re-fit the current
-    /// diagram (after loading a new one, or the Fit button).
     fit_requested: bool,
-    /// Set while a background thread is waiting on Ollama. Polled each frame.
-    result_receiver: Option<Receiver<Result<Diagram, String>>>,
+
+    /// Text currently in the context panel's edit field, and which
+    /// element id it belongs to (so switching selection refreshes it).
+    edit_buffer: String,
+    edit_buffer_for: Option<String>,
+    /// Text currently in the "Ask AI" field.
+    ask_ai_text: String,
+
+    /// Board states to restore on Ctrl+Z / Ctrl+Shift+Z. A plain stack is
+    /// enough for Day 3 — no command pattern needed.
+    history: Vec<LaidOutDiagram>,
+    redo_stack: Vec<LaidOutDiagram>,
+
+    /// Set while a background thread is generating a brand new diagram.
+    generate_receiver: Option<Receiver<Result<Diagram, String>>>,
+    /// Set while a background thread is asking the AI to modify the board.
+    operation_receiver: Option<Receiver<Result<OperationBatch, String>>>,
 }
 
 impl Default for ExplainBoardApp {
@@ -54,20 +67,64 @@ impl Default for ExplainBoardApp {
             prompt: String::new(),
             layout: layout::layout(&diagram::example_tcp()),
             camera: Camera::default(),
-            status: "Loaded an example diagram. Type a prompt and press the arrow to ask Ollama for a new one."
-                .to_string(),
+            status: "Loaded an example diagram. Select an element to ask the AI about it.".to_string(),
             ollama_ok: true,
             tool: Tool::Select,
             selected_id: None,
             drag_offset: egui::Vec2::ZERO,
             fit_requested: true,
-            result_receiver: None,
+            edit_buffer: String::new(),
+            edit_buffer_for: None,
+            ask_ai_text: String::new(),
+            history: Vec::new(),
+            redo_stack: Vec::new(),
+            generate_receiver: None,
+            operation_receiver: None,
         }
     }
 }
 
 impl ExplainBoardApp {
+    fn busy(&self) -> bool {
+        self.generate_receiver.is_some() || self.operation_receiver.is_some()
+    }
+
+    // ---------------------------------------------------------------
+    // History
+    // ---------------------------------------------------------------
+
+    /// Snapshots the current board before any mutating action, so it can be
+    /// restored with undo. Call this FIRST, before changing self.layout.
+    fn push_history(&mut self) {
+        self.history.push(self.layout.clone());
+        self.redo_stack.clear();
+        if self.history.len() > 30 {
+            self.history.remove(0); // keep the stack from growing forever
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some(previous) = self.history.pop() {
+            self.redo_stack.push(std::mem::replace(&mut self.layout, previous));
+            self.selected_id = None;
+            self.status = "Undid last change.".to_string();
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.history.push(std::mem::replace(&mut self.layout, next));
+            self.selected_id = None;
+            self.status = "Redid change.".to_string();
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Board-changing actions
+    // ---------------------------------------------------------------
+
     fn load_diagram(&mut self, diagram: Diagram, status_prefix: &str) {
+        self.push_history();
         let diagram = diagram.sanitize();
         let warnings = diagram.validate();
         self.layout = layout::layout(&diagram);
@@ -80,28 +137,174 @@ impl ExplainBoardApp {
         };
     }
 
-    /// Kicks off a background thread that talks to Ollama, so the UI never
-    /// freezes while waiting. The result comes back through result_receiver.
+    fn delete_selected(&mut self) {
+        let Some(id) = self.selected_id.clone() else { return };
+        self.push_history();
+        match self.layout.remove_element(&id) {
+            Ok(()) => {
+                self.selected_id = None;
+                self.status = "Deleted.".to_string();
+            }
+            Err(message) => {
+                self.history.pop(); // nothing changed; drop the unused snapshot
+                self.status = format!("Could not delete: {message}");
+            }
+        }
+    }
+
+    fn duplicate_selected(&mut self) {
+        let Some(id) = self.selected_id.clone() else { return };
+        self.push_history();
+        match self.layout.duplicate_element(&id) {
+            Ok(new_id) => {
+                self.selected_id = Some(new_id);
+                self.status = "Duplicated.".to_string();
+            }
+            Err(message) => {
+                self.history.pop();
+                self.status = format!("Could not duplicate: {message}");
+            }
+        }
+    }
+
+    fn save_edit(&mut self) {
+        let Some(id) = self.selected_id.clone() else { return };
+        self.push_history();
+        match self.layout.update_element_text(&id, &self.edit_buffer) {
+            Ok(()) => self.status = "Updated.".to_string(),
+            Err(message) => {
+                self.history.pop();
+                self.status = format!("Could not update: {message}");
+            }
+        }
+    }
+
+    /// Kicks off a background thread that asks Ollama to modify the board
+    /// around the selected element. Mirrors start_generate's threading
+    /// pattern, just with a different request/response type.
+    fn start_ask_ai(&mut self, request: String) {
+        let Some(id) = self.selected_id.clone() else { return };
+        let Some(text) = self.layout.element_text(&id) else { return };
+        if self.busy() {
+            return;
+        }
+
+        let board_summary = self.layout.describe();
+        self.status = "Ollama thinking...".to_string();
+
+        let (sender, receiver) = mpsc::channel();
+        self.operation_receiver = Some(receiver);
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().expect("failed to start async runtime");
+            let result = runtime.block_on(ollama::request_operations(&board_summary, &id, &text, &request));
+            let _ = sender.send(result);
+        });
+    }
+
     fn start_generate(&mut self) {
         let prompt = self.prompt.trim().to_string();
         if prompt.is_empty() {
             self.status = "Type something to explain first.".to_string();
             return;
         }
+        if self.busy() {
+            return;
+        }
 
         self.status = "Generating...".to_string();
 
         let (sender, receiver) = mpsc::channel();
-        self.result_receiver = Some(receiver);
+        self.generate_receiver = Some(receiver);
 
         std::thread::spawn(move || {
-            // eframe's event loop is not async, so we spin up a small tokio
-            // runtime just for this one request, run it to completion, and
-            // send the result back over the channel.
             let runtime = tokio::runtime::Runtime::new().expect("failed to start async runtime");
             let result = runtime.block_on(ollama::generate_diagram(&prompt));
-            let _ = sender.send(result); // ignore send errors (window may have closed)
+            let _ = sender.send(result);
         });
+    }
+
+    // ---------------------------------------------------------------
+    // Polling background AI work
+    // ---------------------------------------------------------------
+
+    fn poll_generate(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.generate_receiver else { return };
+        match receiver.try_recv() {
+            Ok(Ok(new_diagram)) => {
+                self.ollama_ok = true;
+                self.load_diagram(new_diagram, "Done");
+                self.generate_receiver = None;
+            }
+            Ok(Err(error_message)) => {
+                self.ollama_ok = false;
+                self.status = format!("Error: {error_message}");
+                self.generate_receiver = None;
+            }
+            Err(_not_ready_yet) => ctx.request_repaint(),
+        }
+    }
+
+    fn poll_operations(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.operation_receiver else { return };
+        match receiver.try_recv() {
+            Ok(Ok(batch)) => {
+                self.ollama_ok = true;
+                // The board changes here, so it must be snapshotted first —
+                // this is what makes Ctrl+Z undo an AI modification.
+                self.push_history();
+                let warnings = self.layout.apply_operations(batch.operations);
+                self.status = if warnings.is_empty() {
+                    "AI updated the diagram.".to_string()
+                } else {
+                    format!("AI updated the diagram. {}", warnings.join(" "))
+                };
+                self.operation_receiver = None;
+            }
+            Ok(Err(error_message)) => {
+                self.ollama_ok = false;
+                self.status = format!("Error: {error_message}");
+                self.operation_receiver = None;
+            }
+            Err(_not_ready_yet) => ctx.request_repaint(),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Keyboard shortcuts
+    // ---------------------------------------------------------------
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.wants_keyboard_input() {
+            return; // a text field is focused; don't steal its keystrokes
+        }
+
+        let (escape, delete, backspace, ctrl_z, ctrl_shift_z, ctrl_d) = ctx.input(|input| {
+            let ctrl = input.modifiers.command;
+            (
+                input.key_pressed(egui::Key::Escape),
+                input.key_pressed(egui::Key::Delete),
+                input.key_pressed(egui::Key::Backspace),
+                ctrl && !input.modifiers.shift && input.key_pressed(egui::Key::Z),
+                ctrl && input.modifiers.shift && input.key_pressed(egui::Key::Z),
+                ctrl && input.key_pressed(egui::Key::D),
+            )
+        });
+
+        if escape {
+            self.selected_id = None;
+        }
+        if (delete || backspace) && self.selected_id.is_some() {
+            self.delete_selected();
+        }
+        if ctrl_shift_z {
+            self.redo();
+        } else if ctrl_z {
+            self.undo();
+        }
+        if ctrl_d && self.selected_id.is_some() {
+            self.duplicate_selected();
+        }
     }
 }
 
@@ -109,27 +312,13 @@ impl eframe::App for ExplainBoardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_visuals(egui::Visuals::dark());
 
-        // Check whether the background Ollama request has finished yet.
-        if let Some(receiver) = &self.result_receiver {
-            match receiver.try_recv() {
-                Ok(Ok(new_diagram)) => {
-                    self.ollama_ok = true;
-                    self.load_diagram(new_diagram, "Done");
-                    self.result_receiver = None;
-                }
-                Ok(Err(error_message)) => {
-                    self.ollama_ok = false;
-                    self.status = format!("Error: {error_message}");
-                    self.result_receiver = None;
-                }
-                Err(_not_ready_yet) => {
-                    ctx.request_repaint(); // keep checking next frame
-                }
-            }
-        }
+        self.poll_generate(ctx);
+        self.poll_operations(ctx);
+        self.handle_shortcuts(ctx);
 
         self.top_bar(ctx);
         self.toolbar(ctx);
+        self.context_panel(ctx);
         self.canvas(ctx);
     }
 }
@@ -140,23 +329,28 @@ impl ExplainBoardApp {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("ExplainBoard").color(theme::TEXT_ON_DARK).strong().size(16.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let dot_color = if self.ollama_ok { theme::OK_GREEN } else { theme::ERROR_RED };
+                    let (dot_color, status_text) = if self.busy() {
+                        (theme::MUTED_TEXT, "Ollama thinking...")
+                    } else if !self.ollama_ok {
+                        (theme::ERROR_RED, "Ollama offline")
+                    } else {
+                        (theme::OK_GREEN, "Ready")
+                    };
                     ui.colored_label(dot_color, "●");
-                    ui.label(egui::RichText::new("Ollama").color(theme::MUTED_TEXT));
+                    ui.label(egui::RichText::new(status_text).color(theme::MUTED_TEXT));
                 });
             });
 
             ui.add_space(8.0);
 
-            let is_generating = self.result_receiver.is_some();
             egui::Frame::NONE
                 .fill(theme::SURFACE)
                 .corner_radius(10.0)
-                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
                 .inner_margin(egui::Margin::same(10))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        if is_generating {
+                        if self.generate_receiver.is_some() {
                             ui.add(egui::Spinner::new().size(16.0));
                             ui.label(egui::RichText::new("Generating explanation...").color(theme::MUTED_TEXT));
                         } else {
@@ -168,7 +362,7 @@ impl ExplainBoardApp {
                                     .frame(false),
                             );
                             let submitted = text_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            if ui.button("↗").clicked() || submitted {
+                            if ui.add_enabled(!self.busy(), egui::Button::new("↗")).clicked() || (submitted && !self.busy()) {
                                 self.start_generate();
                             }
                         }
@@ -218,15 +412,90 @@ impl ExplainBoardApp {
                     self.camera = Camera::default();
                 }
                 if ui.button("Clear").clicked() {
+                    self.push_history();
                     self.layout = layout::layout(&Diagram { title: String::new(), elements: Vec::new() });
                     self.selected_id = None;
                     self.status = "Cleared.".to_string();
+                }
+                ui.separator();
+                if ui.add_enabled(!self.history.is_empty(), egui::Button::new("Undo")).clicked() {
+                    self.undo();
+                }
+                if ui.add_enabled(!self.redo_stack.is_empty(), egui::Button::new("Redo")).clicked() {
+                    self.redo();
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(format!("{:.0}%", self.camera.zoom * 100.0)).color(theme::TEXT_ON_DARK));
                 });
             });
         });
+    }
+
+    fn context_panel(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.selected_id.clone() else { return };
+        let busy = self.busy();
+
+        egui::SidePanel::right("context_panel")
+            .resizable(false)
+            .min_width(260.0)
+            .frame(theme::dark_frame())
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(&id).color(theme::TEXT_ON_DARK).strong().size(15.0));
+                ui.add_space(8.0);
+
+                if self.edit_buffer_for.as_deref() != Some(id.as_str()) {
+                    self.edit_buffer = self.layout.element_text(&id).unwrap_or_default();
+                    self.edit_buffer_for = Some(id.clone());
+                }
+
+                ui.label(egui::RichText::new("Text").color(theme::MUTED_TEXT).small());
+                ui.text_edit_singleline(&mut self.edit_buffer);
+                if ui.button("Save text").clicked() {
+                    self.save_edit();
+                }
+
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("AI actions").color(theme::MUTED_TEXT).small());
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy, egui::Button::new("Explain")).clicked() {
+                        self.start_ask_ai("Explain this element in more detail.".to_string());
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new("Expand")).clicked() {
+                        self.start_ask_ai("Expand this concept with 2 or 3 additional connected concepts.".to_string());
+                    }
+                });
+                if ui.add_enabled(!busy, egui::Button::new("Simplify")).clicked() {
+                    self.start_ask_ai("Simplify this concept for a first-year university student.".to_string());
+                }
+
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("Ask AI about this element").color(theme::MUTED_TEXT).small());
+                ui.text_edit_singleline(&mut self.ask_ai_text);
+                let can_ask = !busy && !self.ask_ai_text.trim().is_empty();
+                if ui.add_enabled(can_ask, egui::Button::new("Ask")).clicked() {
+                    let request = self.ask_ai_text.trim().to_string();
+                    self.ask_ai_text.clear();
+                    self.start_ask_ai(request);
+                }
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Duplicate").clicked() {
+                        self.duplicate_selected();
+                    }
+                    if ui.button("Delete").clicked() {
+                        self.delete_selected();
+                    }
+                });
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("Ctrl+D duplicate · Delete key removes · Esc deselects · Ctrl+Z undo · Ctrl+Shift+Z redo")
+                        .color(theme::MUTED_TEXT)
+                        .small(),
+                );
+            });
     }
 
     fn canvas(&mut self, ctx: &egui::Context) {

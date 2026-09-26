@@ -4,7 +4,7 @@
 
 use crate::layout::{LaidOutDiagram, LayoutArrow};
 use crate::theme;
-use eframe::egui::{self, Align2, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
+use eframe::egui::{Align2, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
 
 /// Tracks how far the whiteboard has been panned and how zoomed in it is.
 ///
@@ -122,14 +122,14 @@ pub fn draw_diagram(
 
 fn draw_box_shape(painter: &Painter, rect: Rect, selected: bool) {
     let border_color = if selected { theme::SELECTED_BORDER } else { theme::BORDER_STRONG };
-    let border_width = if selected { 2.5 } else { 1.5 };
+    let border_width = if selected { 2.5_f32 } else { 1.5_f32 };
     painter.rect_filled(rect, 8.0, theme::SURFACE);
     painter.rect_stroke(rect, 8.0, Stroke::new(border_width, border_color), StrokeKind::Outside);
 }
 
 fn draw_circle_shape(painter: &Painter, center: Pos2, radius: f32, selected: bool) {
     let border_color = if selected { theme::SELECTED_BORDER } else { theme::BORDER_STRONG };
-    let border_width = if selected { 2.5 } else { 1.5 };
+    let border_width = if selected { 2.5_f32 } else { 1.5_f32 };
     painter.circle_filled(center, radius, theme::SURFACE);
     painter.circle_stroke(center, radius, Stroke::new(border_width, border_color));
 }
@@ -146,7 +146,7 @@ fn draw_centered_lines(painter: &Painter, center: Pos2, lines: &[String], zoom: 
 }
 
 fn draw_arrow(painter: &Painter, start: Pos2, end: Pos2, label: &str, zoom: f32) {
-    painter.line_segment([start, end], Stroke::new(1.8, theme::BORDER_STRONG));
+    painter.line_segment([start, end], Stroke::new(1.8_f32, theme::BORDER_STRONG));
 
     // A simple arrowhead: two short lines angled back from the tip.
     let direction = (end - start).normalized();
@@ -154,8 +154,8 @@ fn draw_arrow(painter: &Painter, start: Pos2, end: Pos2, label: &str, zoom: f32)
     let head_angle = 0.45_f32; // radians
     let left_wing = rotate(direction, head_angle) * -head_length;
     let right_wing = rotate(direction, -head_angle) * -head_length;
-    painter.line_segment([end, end + left_wing], Stroke::new(1.8, theme::BORDER_STRONG));
-    painter.line_segment([end, end + right_wing], Stroke::new(1.8, theme::BORDER_STRONG));
+    painter.line_segment([end, end + left_wing], Stroke::new(1.8_f32, theme::BORDER_STRONG));
+    painter.line_segment([end, end + right_wing], Stroke::new(1.8_f32, theme::BORDER_STRONG));
 
     if !label.is_empty() {
         let midpoint = start + (end - start) * 0.5;
