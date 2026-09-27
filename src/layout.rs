@@ -14,6 +14,7 @@
 use crate::diagram::{Diagram, Element};
 use crate::operations::{NewElement, Operation};
 use eframe::egui::{Color32, Pos2, Rect, Vec2};
+use serde::{Deserialize, Serialize};
 
 const BOX_MIN_WIDTH: f32 = 140.0;
 const BOX_MAX_WIDTH: f32 = 260.0;
@@ -35,13 +36,13 @@ const MOVE_NEAR_OFFSET: f32 = 180.0; // how far "move near X" places an element 
 /// editing, deleting, duplicating — works identically for both, so a note
 /// is simply a `LayoutBox` with a different `style` rather than a whole
 /// separate object type.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum BoxStyle {
     Card,
     Note,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LayoutBox {
     pub id: String,
     pub lines: Vec<String>, // pre-wrapped text, ready to draw line by line
@@ -49,7 +50,7 @@ pub struct LayoutBox {
     pub style: BoxStyle,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LayoutCircle {
     pub id: String,
     pub lines: Vec<String>,
@@ -60,7 +61,7 @@ pub struct LayoutCircle {
 /// An arrow that only knows the *ids* it connects. Its actual start/end
 /// points are computed on demand by `resolve_arrows()`, so if a box moves,
 /// the arrow follows automatically.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ArrowLink {
     pub from: String,
     pub to: String,
@@ -70,7 +71,7 @@ pub struct ArrowLink {
 /// An arrow with concrete world-space start/end points, ready to draw.
 /// `from`/`to` are kept alongside (even though the points are already
 /// computed) so the board can still be described and validated by id.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LayoutArrow {
     pub start: Pos2,
     pub end: Pos2,
@@ -81,7 +82,7 @@ pub struct LayoutArrow {
 
 /// A freehand pen stroke. Named `PenStroke` (not `Stroke`) to avoid clashing
 /// with egui's own `Stroke` type (a line style), which the renderer also uses.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PenStroke {
     pub id: String,
     pub points: Vec<Pos2>, // world-space
@@ -89,7 +90,7 @@ pub struct PenStroke {
     pub width: f32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LaidOutDiagram {
     pub title: String,
     pub boxes: Vec<LayoutBox>,

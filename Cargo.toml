@@ -9,3 +9,8 @@ reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 eframe = "0.31"
+# Depending on egui directly (same version eframe already uses) lets us turn
+# on its "serde" feature, which is what makes Pos2/Rect/Color32/Vec2 —
+# already used throughout layout.rs — serializable. No new dependency, just
+# unlocking a feature of one we already have transitively.
+egui = { version = "0.31", features = ["serde"] }

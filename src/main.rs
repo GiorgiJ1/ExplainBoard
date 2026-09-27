@@ -2,6 +2,7 @@ mod diagram;
 mod layout;
 mod ollama;
 mod operations;
+mod persistence;
 mod renderer;
 mod theme;
 
