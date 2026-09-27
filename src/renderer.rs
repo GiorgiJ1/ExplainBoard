@@ -2,7 +2,7 @@
 // nothing about mouse dragging — main.rs handles input and just calls the
 // functions here once per frame.
 
-use crate::layout::{LaidOutDiagram, LayoutArrow};
+use crate::layout::{BoxStyle, LaidOutDiagram, LayoutArrow};
 use crate::theme;
 use eframe::egui::{self, Align2, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
 
@@ -107,7 +107,7 @@ pub fn draw_diagram(
         let size = b.rect.size() * camera.zoom;
         let rect = Rect::from_min_size(top_left, size);
         let selected = selected_id == Some(b.id.as_str());
-        draw_box_shape(painter, rect, selected);
+        draw_box_shape(painter, rect, selected, b.style);
         draw_centered_lines(painter, rect.center(), &b.lines, camera.zoom);
     }
 
@@ -123,8 +123,17 @@ pub fn draw_diagram(
 /// Draws every completed pen stroke. Called after `draw_diagram` so
 /// hand-drawn annotations render on top of AI-generated content, matching
 /// how someone would actually annotate over a printed diagram.
-pub fn draw_strokes(painter: &Painter, canvas_origin: Pos2, layout: &LaidOutDiagram, camera: &Camera) {
+pub fn draw_strokes(painter: &Painter, canvas_origin: Pos2, layout: &LaidOutDiagram, camera: &Camera, selected_id: Option<&str>) {
     for stroke in &layout.strokes {
+        if selected_id == Some(stroke.id.as_str()) {
+            // A soft halo behind the stroke shows it's selected, the same
+            // way a box/circle gets a brighter glow when selected.
+            let screen_points: Vec<Pos2> = stroke.points.iter().map(|p| camera.world_to_screen(canvas_origin, *p)).collect();
+            let halo_width = stroke.width * camera.zoom + 10.0;
+            for pair in screen_points.windows(2) {
+                painter.line_segment([pair[0], pair[1]], Stroke::new(halo_width, theme::SELECTED_BORDER.gamma_multiply(0.35)));
+            }
+        }
         draw_stroke_points(painter, canvas_origin, &stroke.points, stroke.color, stroke.width, camera);
     }
 }
@@ -172,15 +181,27 @@ fn glow_circle_stroke(painter: &Painter, center: Pos2, radius: f32, color: egui:
 }
 
 fn glow_line(painter: &Painter, start: Pos2, end: Pos2, color: egui::Color32) {
-    painter.line_segment([start, end], Stroke::new(5.0, color.gamma_multiply(0.15)));
-    painter.line_segment([start, end], Stroke::new(1.6, color));
+    painter.line_segment([start, end], Stroke::new(5.0_f32, color.gamma_multiply(0.15)));
+    painter.line_segment([start, end], Stroke::new(1.6_f32, color));
 }
 
-fn draw_box_shape(painter: &Painter, rect: Rect, selected: bool) {
-    let color = if selected { theme::SELECTED_BORDER } else { theme::BORDER_STRONG };
-    let intensity = if selected { 1.5 } else { 1.0 };
-    painter.rect_filled(rect, 10.0, theme::SURFACE);
-    glow_rect_stroke(painter, rect, 10.0, color, intensity);
+fn draw_box_shape(painter: &Painter, rect: Rect, selected: bool, style: BoxStyle) {
+    match style {
+        BoxStyle::Card => {
+            let color = if selected { theme::SELECTED_BORDER } else { theme::BORDER_STRONG };
+            let intensity = if selected { 1.5 } else { 1.0 };
+            painter.rect_filled(rect, 10.0, theme::SURFACE);
+            glow_rect_stroke(painter, rect, 10.0, color, intensity);
+        }
+        BoxStyle::Note => {
+            // A note is just handwritten-feeling text sitting on the
+            // canvas — no card, no border, unless it's selected, in which
+            // case a soft glow shows the user what they've got selected.
+            if selected {
+                glow_rect_stroke(painter, rect, 6.0, theme::SELECTED_BORDER, 1.0);
+            }
+        }
+    }
 }
 
 fn draw_circle_shape(painter: &Painter, center: Pos2, radius: f32, selected: bool) {

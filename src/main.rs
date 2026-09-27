@@ -31,6 +31,7 @@ enum Tool {
     Pan,
     Pen,
     Eraser,
+    Text,
 }
 
 const PEN_COLORS: &[egui::Color32] = &[
@@ -48,6 +49,10 @@ const PEN_WIDTHS: &[(&str, f32)] = &[("S", 2.0), ("M", 4.0), ("L", 8.0)];
 /// erase it, at 100% zoom. Divided by the current zoom so it feels like a
 /// constant-size eraser on screen regardless of zoom level.
 const ERASER_SCREEN_RADIUS: f32 = 14.0;
+
+/// Same idea as ERASER_SCREEN_RADIUS, but for clicking to *select* a
+/// stroke in Select mode — tighter, since selecting should feel precise.
+const SELECT_STROKE_SCREEN_RADIUS: f32 = 8.0;
 
 /// Minimum world-space distance between recorded points in a pen stroke,
 /// so a slow-moving mouse doesn't flood the stroke with redundant points.
@@ -310,7 +315,7 @@ impl ExplainBoardApp {
             return; // a text field is focused; don't steal its keystrokes
         }
 
-        let (escape, delete, backspace, ctrl_z, ctrl_shift_z, ctrl_d, key_v, key_p, key_e) = ctx.input(|input| {
+        let (escape, delete, backspace, ctrl_z, ctrl_shift_z, ctrl_d, key_v, key_p, key_e, key_t) = ctx.input(|input| {
             let ctrl = input.modifiers.command;
             (
                 input.key_pressed(egui::Key::Escape),
@@ -322,6 +327,7 @@ impl ExplainBoardApp {
                 !ctrl && input.key_pressed(egui::Key::V),
                 !ctrl && input.key_pressed(egui::Key::P),
                 !ctrl && input.key_pressed(egui::Key::E),
+                !ctrl && input.key_pressed(egui::Key::T),
             )
         });
 
@@ -347,6 +353,9 @@ impl ExplainBoardApp {
         }
         if key_e {
             self.tool = Tool::Eraser;
+        }
+        if key_t {
+            self.tool = Tool::Text;
         }
     }
 }
@@ -437,6 +446,10 @@ impl ExplainBoardApp {
                     if toggle_button(ui, "Eraser", self.tool == Tool::Eraser) {
                         self.tool = Tool::Eraser;
                     }
+                    ui.add_space(4.0);
+                    if toggle_button(ui, "Text", self.tool == Tool::Text) {
+                        self.tool = Tool::Text;
+                    }
 
                     if self.tool == Tool::Pen {
                         ui.add_space(10.0);
@@ -448,7 +461,7 @@ impl ExplainBoardApp {
                                 let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::click());
                                 ui.painter().circle_filled(rect.center(), size / 2.0, color);
                                 if picked {
-                                    ui.painter().circle_stroke(rect.center(), size / 2.0 + 2.0, egui::Stroke::new(1.5, theme::TEXT_ON_DARK));
+                                    ui.painter().circle_stroke(rect.center(), size / 2.0 + 2.0, egui::Stroke::new(1.5_f32, theme::TEXT_ON_DARK));
                                 }
                                 if response.clicked() {
                                     self.pen_color = color;
@@ -528,11 +541,11 @@ impl ExplainBoardApp {
 
             ui.add_space(6.0);
 
-            egui::Frame::none()
+            egui::Frame::NONE
                 .fill(theme::SURFACE)
                 .corner_radius(14.0)
-                .stroke(egui::Stroke::new(1.2, theme::ACCENT))
-                .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                .stroke(egui::Stroke::new(1.2_f32, theme::ACCENT))
+                .inner_margin(egui::Margin::symmetric(14, 10))
                 .show(ui, |ui| {
                     if self.generate_receiver.is_some() {
                         ui.horizontal(|ui| {
@@ -577,42 +590,50 @@ impl ExplainBoardApp {
             .min_width(260.0)
             .frame(theme::dark_frame())
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new(&id).color(theme::TEXT_ON_DARK).strong().size(15.0));
+                let is_stroke = self.layout.is_stroke(&id);
+                ui.label(egui::RichText::new(if is_stroke { "Stroke" } else { id.as_str() }).color(theme::TEXT_ON_DARK).strong().size(15.0));
                 ui.add_space(8.0);
 
-                if self.edit_buffer_for.as_deref() != Some(id.as_str()) {
-                    self.edit_buffer = self.layout.element_text(&id).unwrap_or_default();
-                    self.edit_buffer_for = Some(id.clone());
-                }
-
-                ui.label(egui::RichText::new("Text").color(theme::MUTED_TEXT).small());
-                ui.text_edit_singleline(&mut self.edit_buffer);
-                if ui.button("Save text").clicked() {
-                    self.save_edit();
-                }
-
-                ui.add_space(12.0);
-                ui.label(egui::RichText::new("AI actions").color(theme::MUTED_TEXT).small());
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(!busy, egui::Button::new("Explain")).clicked() {
-                        self.start_ask_ai("Explain this element in more detail.".to_string());
+                if is_stroke {
+                    // A stroke has no text, so there's nothing to edit or
+                    // ask the AI about — just Duplicate/Delete below.
+                    ui.label(egui::RichText::new("A freehand drawing.").color(theme::MUTED_TEXT).small());
+                } else {
+                    if self.edit_buffer_for.as_deref() != Some(id.as_str()) {
+                        self.edit_buffer = self.layout.element_text(&id).unwrap_or_default();
+                        self.edit_buffer_for = Some(id.clone());
                     }
-                    if ui.add_enabled(!busy, egui::Button::new("Expand")).clicked() {
-                        self.start_ask_ai("Expand this concept with 2 or 3 additional connected concepts.".to_string());
-                    }
-                });
-                if ui.add_enabled(!busy, egui::Button::new("Simplify")).clicked() {
-                    self.start_ask_ai("Simplify this concept for a first-year university student.".to_string());
-                }
 
-                ui.add_space(12.0);
-                ui.label(egui::RichText::new("Ask AI about this element").color(theme::MUTED_TEXT).small());
-                ui.text_edit_singleline(&mut self.ask_ai_text);
-                let can_ask = !busy && !self.ask_ai_text.trim().is_empty();
-                if ui.add_enabled(can_ask, egui::Button::new("Ask")).clicked() {
-                    let request = self.ask_ai_text.trim().to_string();
-                    self.ask_ai_text.clear();
-                    self.start_ask_ai(request);
+                    ui.label(egui::RichText::new("Text").color(theme::MUTED_TEXT).small());
+                    let text_response = ui.text_edit_singleline(&mut self.edit_buffer);
+                    let submitted = text_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("Save text").clicked() || submitted {
+                        self.save_edit();
+                    }
+
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new("AI actions").color(theme::MUTED_TEXT).small());
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!busy, egui::Button::new("Explain")).clicked() {
+                            self.start_ask_ai("Explain this element in more detail.".to_string());
+                        }
+                        if ui.add_enabled(!busy, egui::Button::new("Expand")).clicked() {
+                            self.start_ask_ai("Expand this concept with 2 or 3 additional connected concepts.".to_string());
+                        }
+                    });
+                    if ui.add_enabled(!busy, egui::Button::new("Simplify")).clicked() {
+                        self.start_ask_ai("Simplify this concept for a first-year university student.".to_string());
+                    }
+
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new("Ask AI about this element").color(theme::MUTED_TEXT).small());
+                    ui.text_edit_singleline(&mut self.ask_ai_text);
+                    let can_ask = !busy && !self.ask_ai_text.trim().is_empty();
+                    if ui.add_enabled(can_ask, egui::Button::new("Ask")).clicked() {
+                        let request = self.ask_ai_text.trim().to_string();
+                        self.ask_ai_text.clear();
+                        self.start_ask_ai(request);
+                    }
                 }
 
                 ui.add_space(12.0);
@@ -628,9 +649,11 @@ impl ExplainBoardApp {
                 });
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new("Ctrl+D duplicate · Delete key removes · Esc deselects · Ctrl+Z undo · Ctrl+Shift+Z redo")
-                        .color(theme::MUTED_TEXT)
-                        .small(),
+                    egui::RichText::new(
+                        "Ctrl+D duplicate · Delete removes · Esc deselects · Ctrl+Z undo · Ctrl+Shift+Z redo\nV select · P pen · E eraser · T text",
+                    )
+                    .color(theme::MUTED_TEXT)
+                    .small(),
                 );
             });
     }
@@ -658,8 +681,9 @@ impl ExplainBoardApp {
                 }
             }
 
-            // --- Pan: right-drag always pans; left-drag pans only in Hand mode ---
+            // --- Pan: right-drag or middle-drag always pans; left-drag pans only in Hand mode ---
             let panning = response.dragged_by(egui::PointerButton::Secondary)
+                || response.dragged_by(egui::PointerButton::Middle)
                 || (self.tool == Tool::Pan && response.dragged_by(egui::PointerButton::Primary));
             if panning {
                 self.camera.pan += response.drag_delta();
@@ -671,7 +695,8 @@ impl ExplainBoardApp {
                 if starting_drag || response.clicked() {
                     if let Some(mouse_screen) = response.interact_pointer_pos() {
                         let mouse_world = self.camera.screen_to_world(canvas_origin, mouse_screen);
-                        self.selected_id = self.layout.hit_test(mouse_world);
+                        let stroke_radius = SELECT_STROKE_SCREEN_RADIUS / self.camera.zoom;
+                        self.selected_id = self.layout.hit_test(mouse_world, stroke_radius);
                         if let Some(id) = self.selected_id.clone() {
                             if let Some(center) = self.layout.shape_center(&id) {
                                 self.drag_offset = mouse_world - center;
@@ -716,6 +741,18 @@ impl ExplainBoardApp {
                 }
             }
 
+            // --- Text: click to place a new note, then hand off to Select ---
+            if self.tool == Tool::Text && response.clicked() {
+                if let Some(mouse_screen) = response.interact_pointer_pos() {
+                    let mouse_world = self.camera.screen_to_world(canvas_origin, mouse_screen);
+                    self.push_history();
+                    let id = self.layout.add_text_note(mouse_world);
+                    self.selected_id = Some(id);
+                    self.tool = Tool::Select; // so the new note can be dragged like anything else
+                    self.status = "Added a text note — type it in the panel on the right.".to_string();
+                }
+            }
+
             // --- Eraser: remove whatever the cursor touches ---
             if self.tool == Tool::Eraser {
                 let beginning = (response.drag_started() && response.dragged_by(egui::PointerButton::Primary)) || response.clicked();
@@ -744,7 +781,7 @@ impl ExplainBoardApp {
             let mut arrows = self.layout.resolve_arrows();
             arrows.extend(self.layout.fixed_arrows.iter().cloned());
             renderer::draw_diagram(&painter, canvas_origin, &self.layout, &arrows, &self.camera, self.selected_id.as_deref());
-            renderer::draw_strokes(&painter, canvas_origin, &self.layout, &self.camera);
+            renderer::draw_strokes(&painter, canvas_origin, &self.layout, &self.camera, self.selected_id.as_deref());
             if let Some(points) = &self.current_stroke {
                 renderer::draw_live_stroke(&painter, canvas_origin, points, self.pen_color, self.pen_width, &self.camera);
             }

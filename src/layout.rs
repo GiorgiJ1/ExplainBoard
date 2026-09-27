@@ -29,11 +29,24 @@ const PINGPONG_ROW_GAP: f32 = 56.0; // vertical space between successive ping-po
 const DUPLICATE_OFFSET: f32 = 30.0; // how far a duplicated element is nudged from its original
 const MOVE_NEAR_OFFSET: f32 = 180.0; // how far "move near X" places an element from X
 
+/// Whether a box is an AI-generated diagram card (glassy fill + glowing
+/// border) or a plain user-typed text note (just readable text, no
+/// fill/border unless selected). Everything else about a box — dragging,
+/// editing, deleting, duplicating — works identically for both, so a note
+/// is simply a `LayoutBox` with a different `style` rather than a whole
+/// separate object type.
+#[derive(Clone, Copy, PartialEq)]
+pub enum BoxStyle {
+    Card,
+    Note,
+}
+
 #[derive(Clone)]
 pub struct LayoutBox {
     pub id: String,
     pub lines: Vec<String>, // pre-wrapped text, ready to draw line by line
     pub rect: Rect,         // world-space; dragging/editing mutates this directly
+    pub style: BoxStyle,
 }
 
 #[derive(Clone)]
@@ -70,6 +83,7 @@ pub struct LayoutArrow {
 /// with egui's own `Stroke` type (a line style), which the renderer also uses.
 #[derive(Clone)]
 pub struct PenStroke {
+    pub id: String,
     pub points: Vec<Pos2>, // world-space
     pub color: Color32,
     pub width: f32,
@@ -139,11 +153,23 @@ impl LaidOutDiagram {
     }
 
     pub fn shape_center(&self, id: &str) -> Option<Pos2> {
-        self.find_shape(id).map(|(center, _)| center)
+        if let Some((center, _)) = self.find_shape(id) {
+            return Some(center);
+        }
+        self.strokes.iter().find(|s| s.id == id).map(|s| stroke_bounds_center(s))
     }
 
     pub fn element_exists(&self, id: &str) -> bool {
-        self.boxes.iter().any(|b| b.id == id) || self.circles.iter().any(|c| c.id == id)
+        self.boxes.iter().any(|b| b.id == id)
+            || self.circles.iter().any(|c| c.id == id)
+            || self.strokes.iter().any(|s| s.id == id)
+    }
+
+    /// Whether `id` refers to a pen stroke rather than a box/circle. The
+    /// context panel uses this to hide text-editing and AI actions for
+    /// strokes, which have no text content to explain or edit.
+    pub fn is_stroke(&self, id: &str) -> bool {
+        self.strokes.iter().any(|s| s.id == id)
     }
 
     pub fn element_text(&self, id: &str) -> Option<String> {
@@ -156,8 +182,18 @@ impl LaidOutDiagram {
         None
     }
 
-    /// Returns the id of the topmost element under `point` (world space), if any.
-    pub fn hit_test(&self, point: Pos2) -> Option<String> {
+    /// Returns the id of the topmost element under `point` (world space), if
+    /// any. Strokes are checked first because they're drawn on top of
+    /// everything else (see renderer.rs), so that's what a click should
+    /// prefer when things overlap. `stroke_radius` is how close (world
+    /// space) counts as "touching" a stroke — boxes/circles use their exact
+    /// geometry instead, since they have a real area.
+    pub fn hit_test(&self, point: Pos2, stroke_radius: f32) -> Option<String> {
+        for s in &self.strokes {
+            if stroke_hit(s, point, stroke_radius) {
+                return Some(s.id.clone());
+            }
+        }
         for b in &self.boxes {
             if b.rect.contains(point) {
                 return Some(b.id.clone());
@@ -236,6 +272,13 @@ impl LaidOutDiagram {
         }
         if let Some(c) = self.circles.iter_mut().find(|c| c.id == id) {
             c.center = new_center;
+            return;
+        }
+        if let Some(s) = self.strokes.iter_mut().find(|s| s.id == id) {
+            let delta = new_center - stroke_bounds_center(s);
+            for point in &mut s.points {
+                *point += delta;
+            }
         }
     }
 
@@ -247,8 +290,20 @@ impl LaidOutDiagram {
         let bounds = self.bounds();
         let position = Pos2::new(bounds.center().x - width / 2.0, bounds.max.y + VERTICAL_GAP);
         let rect = Rect::from_min_size(position, Vec2::new(width, height));
-        self.boxes.push(LayoutBox { id, lines, rect });
+        self.boxes.push(LayoutBox { id, lines, rect, style: BoxStyle::Card });
         Ok(())
+    }
+
+    /// Creates a new, empty user-typed text note centered at `position`
+    /// (world space) and returns its id, so the caller can select it and
+    /// open it for editing right away. Unlike `add_box`, this is a local
+    /// action — the AI never creates notes, only Card-style boxes.
+    pub fn add_text_note(&mut self, position: Pos2) -> String {
+        let id = unique_id_from(self, "note");
+        let (lines, width, height) = size_box("");
+        let rect = Rect::from_center_size(position, Vec2::new(width, height));
+        self.boxes.push(LayoutBox { id: id.clone(), lines, rect, style: BoxStyle::Note });
+        id
     }
 
     pub fn add_circle(&mut self, id: String, text: String) -> Result<(), String> {
@@ -263,10 +318,11 @@ impl LaidOutDiagram {
     }
 
     pub fn remove_element(&mut self, id: &str) -> Result<(), String> {
-        let before = self.boxes.len() + self.circles.len();
+        let before = self.boxes.len() + self.circles.len() + self.strokes.len();
         self.boxes.retain(|b| b.id != id);
         self.circles.retain(|c| c.id != id);
-        if self.boxes.len() + self.circles.len() == before {
+        self.strokes.retain(|s| s.id != id);
+        if self.boxes.len() + self.circles.len() + self.strokes.len() == before {
             return Err(format!("element \"{id}\" does not exist"));
         }
         // An arrow pointing at a deleted element would dangle and crash the
@@ -300,11 +356,16 @@ impl LaidOutDiagram {
         let offset = Vec2::new(DUPLICATE_OFFSET, DUPLICATE_OFFSET);
 
         if let Some(b) = self.boxes.iter().find(|b| b.id == id).cloned() {
-            self.boxes.push(LayoutBox { id: new_id.clone(), lines: b.lines, rect: b.rect.translate(offset) });
+            self.boxes.push(LayoutBox { id: new_id.clone(), lines: b.lines, rect: b.rect.translate(offset), style: b.style });
             return Ok(new_id);
         }
         if let Some(c) = self.circles.iter().find(|c| c.id == id).cloned() {
             self.circles.push(LayoutCircle { id: new_id.clone(), lines: c.lines, center: c.center + offset, radius: c.radius });
+            return Ok(new_id);
+        }
+        if let Some(s) = self.strokes.iter().find(|s| s.id == id).cloned() {
+            let points = s.points.iter().map(|p| *p + offset).collect();
+            self.strokes.push(PenStroke { id: new_id.clone(), points, color: s.color, width: s.width });
             return Ok(new_id);
         }
         Err(format!("element \"{id}\" does not exist"))
@@ -353,27 +414,41 @@ impl LaidOutDiagram {
         if points.len() < 2 {
             return;
         }
-        self.strokes.push(PenStroke { points, color, width });
+        let id = unique_id_from(self, "stroke");
+        self.strokes.push(PenStroke { id, points, color, width });
     }
 
-    /// Erases whatever is within `radius` (world-space) of `point`: any
-    /// box/circle under the eraser, and any stroke passing near it. This is
-    /// whole-object erasing (a touched stroke disappears entirely) rather
-    /// than partial/pixel erasing, which keeps the model simple. Returns
-    /// true if anything was actually erased.
+    /// Erases everything within `radius` (world-space) of `point`: any
+    /// box/circle under the eraser AND any stroke passing near it, in one
+    /// pass — unlike Select mode (which only ever targets the single
+    /// topmost thing), an eraser dab should clear everything it touches.
+    /// This is whole-object erasing (a touched stroke disappears entirely)
+    /// rather than partial/pixel erasing, which keeps the model simple.
+    /// Returns true if anything was actually erased.
     pub fn erase_at(&mut self, point: Pos2, radius: f32) -> bool {
         let mut erased = false;
 
-        if let Some(id) = self.hit_test(point) {
-            if self.remove_element(&id).is_ok() {
-                erased = true;
-            }
-        }
+        let before_boxes = self.boxes.len();
+        self.boxes.retain(|b| !b.rect.contains(point));
+        erased |= self.boxes.len() != before_boxes;
 
-        let before = self.strokes.len();
+        let before_circles = self.circles.len();
+        self.circles.retain(|c| (point - c.center).length() > c.radius);
+        erased |= self.circles.len() != before_circles;
+
+        let before_strokes = self.strokes.len();
         self.strokes.retain(|s| !stroke_hit(s, point, radius));
-        if self.strokes.len() != before {
-            erased = true;
+        erased |= self.strokes.len() != before_strokes;
+
+        if erased {
+            // Clean up any arrow left dangling by a box/circle we just erased.
+            let remaining: std::collections::HashSet<&str> =
+                self.boxes.iter().map(|b| b.id.as_str()).chain(self.circles.iter().map(|c| c.id.as_str())).collect();
+            self.arrow_links.retain(|a| remaining.contains(a.from.as_str()) && remaining.contains(a.to.as_str()));
+            self.fixed_arrows.retain(|a| match (&a.from, &a.to) {
+                (Some(from), Some(to)) => remaining.contains(from.as_str()) && remaining.contains(to.as_str()),
+                _ => true,
+            });
         }
 
         erased
@@ -419,6 +494,21 @@ fn unique_id_from(board: &LaidOutDiagram, candidate: &str) -> String {
             return attempt;
         }
         counter += 1;
+    }
+}
+
+/// The center of a stroke's bounding box — used as its "position" for
+/// dragging (there's no single natural center for a freehand line, so the
+/// bounding-box center is the simplest reasonable choice).
+fn stroke_bounds_center(stroke: &PenStroke) -> Pos2 {
+    let mut bounds = Rect::NOTHING;
+    for point in &stroke.points {
+        bounds = bounds.union(Rect::from_center_size(*point, Vec2::splat(1.0)));
+    }
+    if bounds.is_finite() {
+        bounds.center()
+    } else {
+        Pos2::ZERO
     }
 }
 
@@ -532,7 +622,7 @@ fn layout_vertical(diagram: &Diagram, nodes: Vec<&Element>, arrows: Vec<&Element
             Element::Box { id, text } => {
                 let (lines, width, height) = size_box(text);
                 let rect = Rect::from_min_size(Pos2::new(-width / 2.0, cursor_y), Vec2::new(width, height));
-                boxes.push(LayoutBox { id: id.clone(), lines, rect });
+                boxes.push(LayoutBox { id: id.clone(), lines, rect, style: BoxStyle::Card });
                 cursor_y += height + VERTICAL_GAP;
             }
             Element::Circle { id, text } => {
@@ -586,7 +676,7 @@ fn layout_two_column(
             Element::Box { text, .. } => {
                 let (lines, width, height) = size_box(text);
                 let rect = Rect::from_min_size(Pos2::new(x - width / 2.0, 0.0), Vec2::new(width, height));
-                boxes.push(LayoutBox { id: id.to_string(), lines, rect });
+                boxes.push(LayoutBox { id: id.to_string(), lines, rect, style: BoxStyle::Card });
             }
             Element::Circle { text, .. } => {
                 let (lines, radius) = size_circle(text);
